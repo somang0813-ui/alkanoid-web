@@ -1,0 +1,615 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no" />
+<title>Arkanoid Web</title>
+<style>
+  html,body{margin:0;height:100%;background:#0b1020;overflow:hidden;touch-action:none;}
+  canvas{display:block;margin:0 auto;background:linear-gradient(#0b1020,#0a0f1a);}
+  .hud{
+    position:fixed;left:0;top:0;right:0;
+    color:#e8eefc;font:14px/1.2 system-ui, -apple-system, Segoe UI, Roboto;
+    padding:10px 12px;display:flex;gap:12px;justify-content:space-between;
+    pointer-events:none; text-shadow:0 1px 0 rgba(0,0,0,.4);
+  }
+  .hint{
+    position:fixed;left:0;right:0;bottom:18%;
+    color:#e8eefc;font:16px system-ui; text-align:center; opacity:.9;
+    pointer-events:none;
+  }
+  .pill{opacity:.95}
+</style>
+</head>
+<body>
+<div class="hud">
+  <div class="pill" id="left">Score 0</div>
+  <div class="pill" id="mid">Stage 1</div>
+  <div class="pill" id="right">Lives 3</div>
+</div>
+<div class="hint" id="hint">Tap to launch • Drag to move</div>
+<canvas id="c"></canvas>
+
+<script>
+(() => {
+  const canvas = document.getElementById('c');
+  const ctx = canvas.getContext('2d');
+  const uiL = document.getElementById('left');
+  const uiM = document.getElementById('mid');
+  const uiR = document.getElementById('right');
+  const hint = document.getElementById('hint');
+
+  // ---------- Resize ----------
+  function resize(){
+    const dpr = Math.max(1, Math.min(2, window.devicePixelRatio || 1));
+    const w = window.innerWidth, h = window.innerHeight;
+    canvas.width = Math.floor(w * dpr);
+    canvas.height = Math.floor(h * dpr);
+    canvas.style.width = w + "px";
+    canvas.style.height = h + "px";
+    ctx.setTransform(dpr,0,0,dpr,0,0);
+  }
+  window.addEventListener('resize', resize);
+  resize();
+
+  // ---------- Utils ----------
+  const clamp = (v,a,b)=>Math.max(a,Math.min(b,v));
+  const rnd = (a,b)=>a+Math.random()*(b-a);
+  const now = ()=>performance.now();
+
+  // ---------- Game State ----------
+  let score = 0;
+  let lives = 3;
+  let stageIndex = 0;
+
+  const W = () => window.innerWidth;
+  const H = () => window.innerHeight;
+
+  const world = {
+    top: 70,                 // HUD 공간 고려
+    bottom: () => H()-10,
+    left: 10,
+    right: () => W()-10
+  };
+
+  // Paddle
+  const paddle = {
+    x: () => W()/2,
+    y: () => H()-90,
+    wBase: 110,
+    h: 16,
+    wMul: 1,
+    get w(){ return this.wBase * this.wMul; },
+    get rect(){ return {x:this._x - this.w/2, y:this._y - this.h/2, w:this.w, h:this.h}; },
+    _x: 0,
+    _y: 0
+  };
+
+  // Balls
+  const balls = [];
+  const baseBallSpeed = { v: 520 };
+  let ballSpeedMul = 1;
+
+  // Lasers
+  const lasers = [];
+
+  // PowerUps
+  const powerups = [];
+  const activePowers = {
+    laserUntil: 0,
+    widthUntil: 0,
+    speedUntil: 0
+  };
+
+  // Simple particles
+  const pops = [];
+
+  // Bricks
+  let bricks = [];
+  let bricksLeft = 0;
+
+  // Levels (0 empty, 1~3 hp)
+  const levels = [
+    { rows: 7, cols: 9, grid: [
+      0,1,1,2,2,2,1,1,0,
+      1,2,2,3,3,3,2,2,1,
+      1,2,3,3,2,3,3,2,1,
+      1,2,2,3,3,3,2,2,1,
+      0,1,2,2,2,2,2,1,0,
+      0,0,1,1,1,1,1,0,0,
+      0,0,0,1,1,1,0,0,0
+    ]},
+    { rows: 8, cols: 9, grid: [
+      1,1,1,1,1,1,1,1,1,
+      1,0,2,0,2,0,2,0,1,
+      1,2,3,2,3,2,3,2,1,
+      1,0,2,0,2,0,2,0,1,
+      1,2,3,3,3,3,3,2,1,
+      1,0,0,2,0,2,0,0,1,
+      1,1,2,2,2,2,2,1,1,
+      0,1,1,0,1,0,1,1,0
+    ]},
+    { rows: 9, cols: 9, grid: [
+      0,0,2,2,2,2,2,0,0,
+      0,2,3,3,3,3,3,2,0,
+      2,3,1,1,1,1,1,3,2,
+      2,3,1,0,0,0,1,3,2,
+      2,3,1,0,2,0,1,3,2,
+      2,3,1,0,0,0,1,3,2,
+      2,3,1,1,1,1,1,3,2,
+      0,2,3,3,3,3,3,2,0,
+      0,0,2,2,2,2,2,0,0
+    ]}
+  ];
+
+  // ---------- Input (touch + mouse) ----------
+  let dragging = false;
+
+  function setPaddleX(clientX){
+    const x = clamp(clientX, world.left + paddle.w/2, world.right() - paddle.w/2);
+    paddle._x = x;
+  }
+
+  function pointerDown(x,y){
+    dragging = true;
+    setPaddleX(x);
+
+    // launch on first tap if any ball is stuck
+    if (balls.some(b=>!b.launched)) {
+      balls.forEach(b=>{
+        if(!b.launched){
+          b.launched = true;
+          const ang = rnd(-0.25,0.25);
+          const sp = baseBallSpeed.v * ballSpeedMul;
+          b.vx = Math.sin(ang) * sp;
+          b.vy = -Math.cos(ang) * sp;
+        }
+      });
+      hint.style.display = "none";
+    }
+  }
+  function pointerMove(x,y){
+    if(!dragging) return;
+    setPaddleX(x);
+  }
+  function pointerUp(){ dragging = false; }
+
+  canvas.addEventListener('pointerdown', e=>{ e.preventDefault(); pointerDown(e.clientX,e.clientY); });
+  canvas.addEventListener('pointermove', e=>{ e.preventDefault(); pointerMove(e.clientX,e.clientY); });
+  canvas.addEventListener('pointerup',   e=>{ e.preventDefault(); pointerUp(); });
+  canvas.addEventListener('pointercancel', e=>{ e.preventDefault(); pointerUp(); });
+
+  // ---------- Spawn / Reset ----------
+  function spawnBall(stuck=true){
+    const b = {
+      x: paddle._x,
+      y: paddle._y - 22,
+      r: 9,
+      vx: 0, vy: 0,
+      launched: !stuck
+    };
+    if(!stuck){
+      const sp = baseBallSpeed.v * ballSpeedMul;
+      const a = rnd(-0.6,0.6);
+      b.vx = Math.sin(a) * sp;
+      b.vy = -Math.cos(a) * sp;
+    }
+    balls.push(b);
+  }
+
+  function resetRound(){
+    balls.length = 0;
+    lasers.length = 0;
+    powerups.length = 0;
+    pops.length = 0;
+    activePowers.laserUntil = 0;
+    activePowers.widthUntil = 0;
+    activePowers.speedUntil = 0;
+    paddle.wMul = 1;
+    ballSpeedMul = 1;
+    hint.style.display = "block";
+    spawnBall(true);
+  }
+
+  function loadStage(i){
+    stageIndex = (i + levels.length) % levels.length;
+    const lv = levels[stageIndex];
+    bricks = [];
+    bricksLeft = 0;
+
+    const margin = 14;
+    const usableW = W() - margin*2;
+    const cellW = usableW / lv.cols;
+    const cellH = 24;
+    const startY = world.top + 34;
+
+    for(let r=0;r<lv.rows;r++){
+      for(let c=0;c<lv.cols;c++){
+        const hp = lv.grid[r*lv.cols+c]||0;
+        if(hp<=0) continue;
+        const x = margin + c*cellW + cellW/2;
+        const y = startY + r*(cellH+6);
+        bricks.push({
+          x, y,
+          w: cellW-8,
+          h: cellH,
+          hp,
+          maxHp: hp
+        });
+        bricksLeft++;
+      }
+    }
+    resetRound();
+    uiM.textContent = `Stage ${stageIndex+1}`;
+  }
+
+  function addScore(s){ score += s; uiL.textContent = `Score ${score}`; }
+  function setLives(n){ lives = n; uiR.textContent = `Lives ${lives}`; }
+
+  // ---------- Powerups ----------
+  const PowerType = {
+    Expand: 'Expand',
+    Shrink: 'Shrink',
+    MultiBall: 'MultiBall',
+    Laser: 'Laser',
+    Slow: 'Slow',
+    Fast: 'Fast'
+  };
+
+  function spawnPowerUp(x,y){
+    const r = Math.random();
+    let type;
+    if(r < 0.20) type = PowerType.Expand;
+    else if(r < 0.35) type = PowerType.Shrink;
+    else if(r < 0.55) type = PowerType.MultiBall;
+    else if(r < 0.75) type = PowerType.Laser;
+    else if(r < 0.88) type = PowerType.Slow;
+    else type = PowerType.Fast;
+
+    powerups.push({ x, y, vy: 160, size: 14, type });
+  }
+
+  function applyPower(type){
+    const t = now();
+    const dur = 10000;
+
+    if(type === PowerType.Expand){
+      paddle.wMul = 1.7;
+      activePowers.widthUntil = t + dur;
+    } else if(type === PowerType.Shrink){
+      paddle.wMul = 0.75;
+      activePowers.widthUntil = t + dur;
+    } else if(type === PowerType.Slow){
+      ballSpeedMul = 0.85;
+      activePowers.speedUntil = t + dur;
+    } else if(type === PowerType.Fast){
+      ballSpeedMul = 1.25;
+      activePowers.speedUntil = t + dur;
+    } else if(type === PowerType.Laser){
+      activePowers.laserUntil = t + dur;
+    } else if(type === PowerType.MultiBall){
+      // 2개 추가
+      spawnBall(false);
+      spawnBall(false);
+    }
+  }
+
+  // ---------- Collision helpers ----------
+  function circleRectCollide(cx,cy,cr, rx,ry,rw,rh){
+    const nx = clamp(cx, rx, rx+rw);
+    const ny = clamp(cy, ry, ry+rh);
+    const dx = cx - nx;
+    const dy = cy - ny;
+    return (dx*dx + dy*dy) <= cr*cr;
+  }
+
+  function reflectBallFromRect(ball, rx,ry,rw,rh){
+    // simple: decide by penetration direction (approx)
+    const cx = ball.x, cy = ball.y, r = ball.r;
+    const nearestX = clamp(cx, rx, rx+rw);
+    const nearestY = clamp(cy, ry, ry+rh);
+    const dx = cx - nearestX;
+    const dy = cy - nearestY;
+
+    // choose axis with larger abs overlap
+    if(Math.abs(dx) > Math.abs(dy)){
+      ball.vx = -ball.vx;
+    } else {
+      ball.vy = -ball.vy;
+    }
+  }
+
+  // ---------- Update loop ----------
+  let last = now();
+
+  function update(){
+    const t = now();
+    const dt = Math.min(0.020, (t - last)/1000);
+    last = t;
+
+    // keep paddle baseline
+    paddle._y = paddle.y();
+
+    // expire powers
+    if(activePowers.widthUntil && t > activePowers.widthUntil){
+      paddle.wMul = 1;
+      activePowers.widthUntil = 0;
+    }
+    if(activePowers.speedUntil && t > activePowers.speedUntil){
+      ballSpeedMul = 1;
+      activePowers.speedUntil = 0;
+    }
+
+    // laser firing
+    if(activePowers.laserUntil && t < activePowers.laserUntil){
+      // fire every ~180ms
+      if(!update._nextLaser) update._nextLaser = 0;
+      if(t > update._nextLaser){
+        update._nextLaser = t + 180;
+        lasers.push({ x: paddle._x - paddle.w*0.30, y: paddle._y - 10, vy: -900 });
+        lasers.push({ x: paddle._x + paddle.w*0.30, y: paddle._y - 10, vy: -900 });
+      }
+    } else {
+      update._nextLaser = 0;
+    }
+
+    // balls
+    for(let i=balls.length-1;i>=0;i--){
+      const b = balls[i];
+
+      if(!b.launched){
+        b.x = paddle._x;
+        b.y = paddle._y - 22;
+        continue;
+      }
+
+      b.x += b.vx * dt;
+      b.y += b.vy * dt;
+
+      // walls
+      if(b.x - b.r < world.left){ b.x = world.left + b.r; b.vx = -b.vx; }
+      if(b.x + b.r > world.right()){ b.x = world.right() - b.r; b.vx = -b.vx; }
+      if(b.y - b.r < world.top){ b.y = world.top + b.r; b.vy = -b.vy; }
+
+      // dead
+      if(b.y - b.r > world.bottom()){
+        // clone balls removed, main ball costs life
+        balls.splice(i,1);
+        if(balls.length===0){
+          setLives(lives-1);
+          if(lives<=0){
+            // reset everything
+            score = 0; uiL.textContent = "Score 0";
+            setLives(3);
+            loadStage(0);
+            return;
+          } else {
+            resetRound();
+            return;
+          }
+        }
+        continue;
+      }
+
+      // paddle collision
+      const pr = paddle.rect;
+      if(circleRectCollide(b.x,b.y,b.r, pr.x,pr.y,pr.w,pr.h) && b.vy>0){
+        // bounce with angle based on hit position
+        const hit = (b.x - (pr.x + pr.w/2)) / (pr.w/2);
+        const ang = clamp(hit, -1, 1) * 0.95;
+        const sp = baseBallSpeed.v * ballSpeedMul;
+        b.vx = Math.sin(ang) * sp;
+        b.vy = -Math.cos(ang) * sp;
+        // nudge upward
+        b.y = pr.y - b.r - 0.5;
+      }
+
+      // bricks collision (check a few)
+      for(let j=bricks.length-1;j>=0;j--){
+        const br = bricks[j];
+        const rx = br.x - br.w/2, ry = br.y - br.h/2;
+        if(circleRectCollide(b.x,b.y,b.r, rx,ry, br.w, br.h)){
+          br.hp -= 1;
+          reflectBallFromRect(b, rx,ry, br.w, br.h);
+
+          if(br.hp <= 0){
+            bricks.splice(j,1);
+            bricksLeft--;
+            addScore(10 * br.maxHp);
+            // particle pop
+            for(let k=0;k<12;k++){
+              pops.push({x:br.x,y:br.y,vx:rnd(-220,220),vy:rnd(-220,220),life:0.5});
+            }
+            // drop chance
+            if(Math.random() < 0.18) spawnPowerUp(br.x, br.y);
+
+            if(bricksLeft <= 0){
+              // next stage + difficulty
+              baseBallSpeed.v += 25;
+              loadStage(stageIndex+1);
+              return;
+            }
+          } else {
+            // hit pop small
+            pops.push({x:br.x,y:br.y,vx:rnd(-120,120),vy:rnd(-120,120),life:0.25});
+          }
+          break;
+        }
+      }
+
+      // speed clamp
+      const sp = Math.hypot(b.vx,b.vy) || 1;
+      const target = baseBallSpeed.v * ballSpeedMul;
+      b.vx = (b.vx/sp) * target;
+      b.vy = (b.vy/sp) * target;
+    }
+
+    // lasers
+    for(let i=lasers.length-1;i>=0;i--){
+      const l = lasers[i];
+      l.y += l.vy * dt;
+      if(l.y < world.top - 40){ lasers.splice(i,1); continue; }
+
+      // hit brick
+      for(let j=bricks.length-1;j>=0;j--){
+        const br = bricks[j];
+        const rx = br.x - br.w/2, ry = br.y - br.h/2;
+        if(l.x > rx && l.x < rx+br.w && l.y > ry && l.y < ry+br.h){
+          br.hp -= 1;
+          lasers.splice(i,1);
+          if(br.hp <= 0){
+            bricks.splice(j,1);
+            bricksLeft--;
+            addScore(10 * br.maxHp);
+            for(let k=0;k<12;k++){
+              pops.push({x:br.x,y:br.y,vx:rnd(-220,220),vy:rnd(-220,220),life:0.5});
+            }
+            if(Math.random() < 0.18) spawnPowerUp(br.x, br.y);
+            if(bricksLeft <= 0){
+              baseBallSpeed.v += 25;
+              loadStage(stageIndex+1);
+              return;
+            }
+          } else {
+            pops.push({x:br.x,y:br.y,vx:rnd(-120,120),vy:rnd(-120,120),life:0.25});
+          }
+          break;
+        }
+      }
+    }
+
+    // powerups fall + pickup
+    const pr = paddle.rect;
+    for(let i=powerups.length-1;i>=0;i--){
+      const p = powerups[i];
+      p.y += p.vy * dt;
+
+      // pickup
+      const dx = Math.abs(p.x - (pr.x + pr.w/2));
+      const dy = Math.abs(p.y - (pr.y + pr.h/2));
+      if(dx < (pr.w/2 + p.size) && dy < (pr.h/2 + p.size)){
+        applyPower(p.type);
+        powerups.splice(i,1);
+        continue;
+      }
+
+      // out
+      if(p.y > world.bottom()+50) powerups.splice(i,1);
+    }
+
+    // particles
+    for(let i=pops.length-1;i>=0;i--){
+      const p = pops[i];
+      p.x += p.vx * dt;
+      p.y += p.vy * dt;
+      p.life -= dt;
+      if(p.life <= 0) pops.splice(i,1);
+    }
+  }
+
+  // ---------- Render ----------
+  function draw(){
+    ctx.clearRect(0,0,W(),H());
+
+    // paddle
+    const pr = paddle.rect;
+    roundRect(pr.x, pr.y, pr.w, pr.h, 10, "#cfe3ff");
+
+    // balls
+    for(const b of balls){
+      circle(b.x,b.y,b.r, "#ffd38a");
+      circle(b.x-3,b.y-3,2.5,"rgba(255,255,255,.8)");
+    }
+
+    // bricks
+    for(const br of bricks){
+      const hp = br.hp;
+      const col = hp===3 ? "#ff6b6b" : hp===2 ? "#ffd166" : "#8ecae6";
+      roundRect(br.x-br.w/2, br.y-br.h/2, br.w, br.h, 8, col);
+      // outline
+      ctx.strokeStyle = "rgba(0,0,0,.25)";
+      ctx.strokeRect(br.x-br.w/2, br.y-br.h/2, br.w, br.h);
+    }
+
+    // lasers
+    for(const l of lasers){
+      ctx.fillStyle = "#a8ffef";
+      ctx.fillRect(l.x-2, l.y-16, 4, 16);
+    }
+
+    // powerups
+    for(const p of powerups){
+      const col =
+        p.type==="Expand" ? "#7CFFB2" :
+        p.type==="Shrink" ? "#B18CFF" :
+        p.type==="MultiBall" ? "#6CCAFF" :
+        p.type==="Laser" ? "#FF5FD7" :
+        p.type==="Slow" ? "#FFE66D" : "#FF9F6D";
+      circle(p.x,p.y,p.size,col);
+      ctx.fillStyle="rgba(0,0,0,.35)";
+      ctx.font="12px system-ui";
+      ctx.textAlign="center";
+      ctx.textBaseline="middle";
+      ctx.fillText(label(p.type), p.x, p.y);
+    }
+
+    // particles
+    for(const p of pops){
+      ctx.globalAlpha = Math.max(0, Math.min(1, p.life/0.5));
+      circle(p.x,p.y,2.2,"#ffffff");
+      ctx.globalAlpha = 1;
+    }
+
+    // deadzone hint line
+    ctx.strokeStyle="rgba(255,255,255,.08)";
+    ctx.beginPath();
+    ctx.moveTo(world.left, world.bottom()-1);
+    ctx.lineTo(world.right(), world.bottom()-1);
+    ctx.stroke();
+  }
+
+  function label(type){
+    if(type==="Expand") return "E";
+    if(type==="Shrink") return "S";
+    if(type==="MultiBall") return "M";
+    if(type==="Laser") return "L";
+    if(type==="Slow") return "Sl";
+    return "F";
+  }
+
+  function circle(x,y,r,color){
+    ctx.beginPath();
+    ctx.arc(x,y,r,0,Math.PI*2);
+    ctx.fillStyle=color;
+    ctx.fill();
+  }
+  function roundRect(x,y,w,h,r,color){
+    const rr = Math.min(r, w/2, h/2);
+    ctx.beginPath();
+    ctx.moveTo(x+rr,y);
+    ctx.arcTo(x+w,y,x+w,y+h,rr);
+    ctx.arcTo(x+w,y+h,x,y+h,rr);
+    ctx.arcTo(x,y+h,x,y,rr);
+    ctx.arcTo(x,y,x+w,y,rr);
+    ctx.closePath();
+    ctx.fillStyle=color;
+    ctx.fill();
+  }
+
+  function loop(){
+    update();
+    draw();
+    requestAnimationFrame(loop);
+  }
+
+  // init
+  paddle._x = W()/2;
+  paddle._y = paddle.y();
+  uiL.textContent = "Score 0";
+  uiR.textContent = "Lives 3";
+  loadStage(0);
+  requestAnimationFrame(loop);
+})();
+</script>
+</body>
+</html>
